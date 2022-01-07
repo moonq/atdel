@@ -43,12 +43,10 @@ class AtDel:
             )
 
     def parse_opts(self):
-        """Options parser
-
-        """
+        """Options parser"""
         parser = argparse.ArgumentParser(
             description="Automatically delete files after due date. Note: file must have same inode to be deleted",
-            epilog="Automate deletion by adding cron '0 0 * * * atdel --delete'"
+            epilog="Automate deletion by adding cron '0 0 * * * atdel --delete'",
         )
         parser.add_argument(
             "--verbose",
@@ -120,7 +118,6 @@ class AtDel:
             )
 
     def db_list(self):
-
 
         data = []
         with sqlite3.connect(self.config_file) as con:
