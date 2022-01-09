@@ -167,7 +167,7 @@ class AtDel:
                         print("Deleting file {}".format(p))
                         os.remove(p)
 
-                # ~ self.db_remove(p)
+                self.db_remove(p)
             except Exception as e:
                 print(e, file=sys.stderr)
 
