@@ -3,50 +3,40 @@ from datetime import datetime, timedelta
 import argparse
 import os
 import shutil
-import sqlite3
 import sys
+import tempfile
+import time
+import subprocess
+
 
 
 class AtDel:
     def __init__(self):
-        self.config_file = os.path.expanduser("~/.cache/atdel")
+        self.script = sys.argv[0]
+        self.queue = "q"
+        self.due = None
+        self.spool_folder = "/var/spool/atjobs/"
         self.parse_opts()
-        self.db_init()
-
-        if self.options.days is not None:
-            self.set_file_status()
-
-        if self.options.days is None and not self.options.delete:
-            self.db_list()
 
         if self.options.delete:
-            self.del_due_files()
+            self.remove_file()
+            return
 
-    def db_init(self):
+        if self.options.remove:
+            self.remove_job()
+            return
 
-        with sqlite3.connect(self.config_file) as con:
-            con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS atdel (
-                    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
-                    inode INTEGER NOT NULL,
-                    added TEXT NOT NULL,
-                    due TEXT NOT NULL
-                );
-            """
-            )
-            con.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_name ON atdel (name);
-            """
-            )
+        if self.due is not None:
+            self.add_job()
+
+        if self.due is None and not self.options.delete:
+            self.list_jobs()
 
     def parse_opts(self):
         """Options parser"""
         parser = argparse.ArgumentParser(
             description="Automatically delete files after due date. Note: file must have same inode to be deleted",
-            epilog="Automate deletion by adding cron '0 0 * * * atdel --delete'",
+            epilog="",
         )
         parser.add_argument(
             "--verbose",
@@ -56,20 +46,46 @@ class AtDel:
             default=False,
             help="Increase verbosity",
         )
+
         parser.add_argument(
-            "--delete",
-            action="store_true",
-            dest="delete",
-            default=False,
-            help="Delete all due files",
+            "-D",
+            action="store",
+            dest="remove",
+            default=None,
+            type=int,
+            help="Remove deletion job ID",
         )
         parser.add_argument(
             "-d",
             action="store",
-            type=int,
-            help="Days to keep files. 0 to remove deletion tag",
+            type=float,
+            help="Days to keep files.",
             default=None,
             dest="days",
+        )
+        parser.add_argument(
+            "-t",
+            action="store",
+            type=str,
+            help="Timespec when to delete, using date -d command. Example '02/01 15:00'",
+            default=None,
+            dest="time",
+        )
+        parser.add_argument(
+            "--delete-file",
+            action="store",
+            dest="delete",
+            default=None,
+            type=str,
+            help="Delete file with ID. Normally this is only called from at job.",
+        )
+        parser.add_argument(
+            "--inode",
+            action="store",
+            dest="inode",
+            default=None,
+            type=int,
+            help="Inode of file stored in jobspec. Normally this is only called from at job.",
         )
         parser.add_argument(
             "files",
@@ -80,105 +96,171 @@ class AtDel:
             nargs="*",
         )
         self.options = parser.parse_args()
-        if self.options.days is None and len(self.options.files) > 0:
-            parser.error("If files set, must give -d for retain length")
+        if (self.options.days is None and self.options.time is None) and len(
+            self.options.files
+        ) > 0:
+            parser.error("If files set, must give -d or -t")
 
-    def set_file_status(self):
+        if self.options.days and self.options.time:
+            parser.error("Only -t OR -d")
 
-        to_remove = self.options.days == 0
-        now = datetime.now()
-        del_delta = timedelta(days=self.options.days)
-        del_time = (now + del_delta).isoformat()
-        now_time = now.isoformat()
+        if self.options.days:
+            self.due = datetime.now().replace(microsecond=0) + timedelta(days=self.options.days)
 
-        with sqlite3.connect(self.config_file) as con:
-            for f in self.options.files:
-                path = os.path.abspath(f)
-                inode = os.stat(f).st_ino
-
-                if to_remove:
-                    rows = con.execute("SELECT name FROM atdel WHERE name = ?", (path,))
-                    if len(rows.fetchall()) == 0:
-                        print("No such file in database: '{}'".format(path))
-                    else:
-                        con.execute(
-                            "DELETE FROM atdel WHERE name = ?;",
-                            (path,),
-                        )
-                        print("Removed: {}".format(path))
-                else:
-                    con.execute(
-                        "INSERT OR REPLACE INTO atdel (name, due, added, inode) values(?, ?, ?, ?);",
-                        (path, del_time, now_time, inode),
+        if self.options.time:
+            self.due = datetime.fromtimestamp(
+                    int(
+                        subprocess.run(
+                            ["date", "-d", self.options.time, "+%s"],
+                            capture_output=True,
+                        ).stdout
                     )
-                    print(f)
-        if not to_remove:
-            print(
-                "To be deleted in {} days, or on {}".format(self.options.days, del_time)
             )
 
-    def db_list(self):
+        if self.options.delete:
+            if self.options.inode is None:
+                parser.error("--inode is required with --delete-file")
 
-        data = []
-        with sqlite3.connect(self.config_file) as con:
-            rows = con.execute("SELECT added, due, name FROM atdel ORDER BY added;")
-            for row in rows:
-                due = (datetime.fromisoformat(row[1]) - datetime.now()).days
-                rel = os.path.relpath(row[2])
-                if rel.startswith(".."):
-                    rel = row[2]
-                data.append([row[0][0:10], row[1][0:10], due, rel])
-        print("{:10s} {:10s} {:4s} {}".format("Added", "Due", "Days", "File"))
-        for row in data:
-            print("{:10s} {:10s} {:4d} {}".format(*row))
+    def add_job(self):
 
-    def del_due_files(self):
+        now = datetime.now().replace(microsecond=0)
+        diff = self.due - now
+        script = """
+#ADDED {added}
+#DELETE {due}
+#INODE {inode}
+#FILE {path}
+{script} --inode {inode} --delete-file '{path_quoted}'
+        """
+
+        print("To be deleted in {} days, or on {}".format(diff.days, self.due))
+
+        for f in self.options.files:
+            path = os.path.abspath(f)
+            inode = os.stat(f).st_ino
+
+            commands = script.format(
+                added=now.isoformat(),
+                due=self.due.isoformat(),
+                inode=inode,
+                path=path,
+                script=self.script,
+                path_quoted=path.replace("'", "\\'"),
+            )
+
+            with tempfile.NamedTemporaryFile(delete=False) as fp:
+                fp.write(commands.encode("utf-8"))
+                fp.close()
+                p = subprocess.run(
+                    [
+                        "at",
+                        "-q",
+                        self.queue,
+                        "-f",
+                        fp.name,
+                        "-t",
+                        self.due.strftime("%Y%m%d%H%M"),
+                    ],
+                    capture_output=True
+                )
+                for row in p.stderr.decode('utf-8').split("\n"):
+                    if row.startswith("job "):
+                        print(" ".join(row.split(" ")[0:2]))
+                os.remove(fp.name)
+
+
+    def list_jobs(self):
+
+        p = subprocess.run(["atq", "-q", self.queue], capture_output=True)
+        jobs = []
+        for row in p.stdout.decode("utf-8").split("\n"):
+            try:
+                id = int(row.split("\t")[0],10)
+                jobs.append(self.parse_job(id))
+            except Exception as e:
+                # ~ print(e)
+                continue
+        jobs.sort(key=lambda x: x['due'])
+        if self.options.verbose:
+            print("{:4s} {:14s} {:14s} {:4s} {}".format("ID", "Added", "Due", "Days", "File"))
+            for job in jobs:
+                job['added_str'] = job['added'].strftime("%y-%m-%d %H:%M")
+                job['due_str'] = job['due'].strftime("%y-%m-%d %H:%M")
+                print("{id:4d} {added_str} {due_str} {days:4.0f} {path}".format(
+                    **job
+                ))
+        else:
+            print("{:4s} {:4s} {}".format("ID", "Days", "File"))
+            for job in jobs:
+                print("{id:4d} {days:4.0f} {path}".format(
+                    **job
+                ))
+
+    def parse_job(self, id):
+
+        p = subprocess.run(["at", "-c", str(id)], capture_output=True)
+        jobspec = {
+            "id": id,
+            "path": None,
+            "added": None,
+            "due": None,
+            "inode": None,
+            "days": None
+        }
+
+        for row in p.stdout.decode("utf-8").split("\n"):
+            try:
+                if row.startswith("#FILE "):
+                    jobspec["path"] = row.strip()[6:]
+                if row.startswith("#ADDED "):
+                    jobspec["added"] = datetime.fromisoformat(row.strip()[7:27])
+                if row.startswith("#DELETE "):
+                    jobspec["due"] = datetime.fromisoformat(row.strip()[8:28])
+                    jobspec["days"] = round((jobspec["due"] - datetime.now()).total_seconds()/86400,2)
+                if row.startswith("#INODE "):
+                    jobspec["inode"] = int(row.strip()[7:])
+
+            except Exception as e:
+                # ~ print("Error parsing ID: {} - {}".format(id, str(e)))
+                raise e
+
+        return jobspec
+
+    def remove_file(self):
         """Delete files where due date has passed"""
 
-        paths = []
-        with sqlite3.connect(self.config_file) as con:
-            rows = con.execute(
-                "SELECT added, due, name, inode FROM atdel ORDER BY added;"
-            )
-            for row in rows:
-                due = (datetime.fromisoformat(row[1]) - datetime.now()).days
-                exists = os.path.exists(row[2])
-                if due < 0 or not exists:
-                    paths.append([row[2], row[3]])
+        inode = self.options.inode
+        path = self.options.delete
 
-        for (p, inode) in paths:
-            try:
-                if not os.path.exists(p):
-                    print("File {} doesnt exist, removing from DB".format(p))
+        try:
+            if not os.path.exists(path):
+                print("File {} doesnt exist.".format(path),
+                        file=sys.stderr
+                )
+            else:
+                curr_inode = os.stat(path).st_ino
+                if curr_inode != inode:
+                    print(
+                        "Path has different inode, possible security issue: {}".format(
+                            path
+                        ),
+                        file=sys.stderr,
+                    )
+                    return
+                if os.path.isdir(path):
+                    print("Deleting folder {}".format(path))
+                    shutil.rmtree(path)
                 else:
-                    curr_inode = os.stat(p).st_ino
-                    if curr_inode != inode:
-                        print(
-                            "Path has different inode, possible security issue: {}".format(
-                                p
-                            ),
-                            file=sys.stderr,
-                        )
-                        continue
-                    if os.path.isdir(p):
-                        print("Deleting folder {}".format(p))
-                        shutil.rmtree(p)
-                    else:
-                        print("Deleting file {}".format(p))
-                        os.remove(p)
+                    print("Deleting file {}".format(path))
+                    os.remove(path)
+        except Exception as e:
+            print(e, file=sys.stderr)
 
-                self.db_remove(p)
-            except Exception as e:
-                print(e, file=sys.stderr)
+    def remove_job(self):
 
-    def db_remove(self, path):
-        with sqlite3.connect(self.config_file) as con:
-            con.execute(
-                """
-                DELETE FROM atdel WHERE name = ?;
-                """,
-                (path,),
-            )
+        p = subprocess.run(
+            ["atrm", str(self.options.remove)],
+        )
 
 
 if __name__ == "__main__":
